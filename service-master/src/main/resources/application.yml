@@ -1,0 +1,14 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://master-db:5432/master
+    username: master
+    password: master
+  kafka:
+    bootstrap-servers: kafka:9092
+
+app:
+  replication:
+    topic: db-replication-events
+
+server:
+  port: 8081

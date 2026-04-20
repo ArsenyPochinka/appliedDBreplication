@@ -1,0 +1,21 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://slave-db:5432/slave
+    username: slave
+    password: slave
+  kafka:
+    bootstrap-servers: kafka:9092
+    consumer:
+      group-id: service-receiver
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "*"
+
+app:
+  replication:
+    topic: db-replication-events
+
+server:
+  port: 8082

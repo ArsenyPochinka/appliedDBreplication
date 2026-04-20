@@ -1,0 +1,23 @@
+CREATE TABLE table_1 (
+    col_1 BIGSERIAL PRIMARY KEY,
+    col_2 VARCHAR(255) NOT NULL UNIQUE,
+    col_3 TIMESTAMP NOT NULL
+);
+
+CREATE TABLE table_2 (
+    col_1 BIGSERIAL PRIMARY KEY,
+    col_2 BIGINT REFERENCES table_1(col_1),
+    col_3 VARCHAR(100) NOT NULL,
+    col_4 VARCHAR(100) NOT NULL,
+    col_5 VARCHAR(255) NOT NULL UNIQUE,
+    col_6 NUMERIC(19,2) NOT NULL,
+    col_7 BOOLEAN NOT NULL,
+    col_8 DATE,
+    col_9 TIME,
+    col_10 TIMESTAMP,
+    col_11 JSONB,
+    col_12 TEXT[],
+    col_13 DOUBLE PRECISION,
+    col_14 TIMESTAMP NOT NULL,
+    col_15 TIMESTAMP NOT NULL
+);
