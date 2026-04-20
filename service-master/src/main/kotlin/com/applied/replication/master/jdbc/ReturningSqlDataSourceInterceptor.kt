@@ -14,11 +14,18 @@ import java.sql.Struct
 import org.springframework.beans.factory.config.BeanPostProcessor
 import org.springframework.jdbc.datasource.DelegatingDataSource
 import org.springframework.stereotype.Component
+import org.springframework.transaction.support.TransactionSynchronizationManager
 import java.lang.reflect.InvocationHandler
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 import java.lang.reflect.Proxy
+import java.util.concurrent.atomic.AtomicLong
 import javax.sql.DataSource
+
+/** Bound for the lifetime of the current Spring-managed transaction (no extra DB roundtrip). */
+private val replicationCommitIdResourceKey = Any()
+
+private val replicationCommitIdSequence = AtomicLong(0)
 
 @Component
 class ReturningSqlDataSourceInterceptor(
@@ -63,6 +70,13 @@ private class ConnectionInvocationHandler(
     private val replicationEventDispatcher: ReplicationEventDispatcher,
     private val objectMapper: ObjectMapper
 ) : InvocationHandler {
+
+    /**
+     * Used when there is no Spring transaction (e.g. autocommit): one id per logical JDBC connection
+     * obtained from the pool for this proxy instance.
+     */
+    @Volatile
+    private var connectionScopedCommitId: Long? = null
     override fun invoke(proxy: Any, method: Method, args: Array<out Any?>?): Any? {
         val callArgs = (args?.copyOf() as Array<Any?>?) ?: emptyArray()
         val maybeSql = callArgs.firstOrNull() as? String
@@ -100,17 +114,40 @@ private class ConnectionInvocationHandler(
         statement: PreparedStatement,
         mutationMeta: ReturningMutationJdbcExecutor.MutationMeta
     ): PreparedStatement {
+        val commitId = resolveCommitId()
         return Proxy.newProxyInstance(
             statement.javaClass.classLoader,
             arrayOf(PreparedStatement::class.java),
-            PreparedStatementInvocationHandler(statement, mutationMeta, replicationEventDispatcher, objectMapper)
+            PreparedStatementInvocationHandler(statement, mutationMeta, commitId, replicationEventDispatcher, objectMapper)
         ) as PreparedStatement
+    }
+
+    /**
+     * JDBC has no portable "transaction id" without querying the database.
+     * We use Spring's transaction-bound resource when a transaction is active; otherwise a stable id
+     * for this connection proxy (typical autocommit / non-Spring JDBC usage).
+     */
+    private fun resolveCommitId(): Long {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+            val existing = TransactionSynchronizationManager.getResource(replicationCommitIdResourceKey) as? Long
+            if (existing != null) {
+                return existing
+            }
+            val id = replicationCommitIdSequence.incrementAndGet()
+            TransactionSynchronizationManager.bindResource(replicationCommitIdResourceKey, id)
+            return id
+        }
+        connectionScopedCommitId?.let { return it }
+        val id = replicationCommitIdSequence.incrementAndGet()
+        connectionScopedCommitId = id
+        return id
     }
 }
 
 private class PreparedStatementInvocationHandler(
     private val target: PreparedStatement,
     private val mutationMeta: ReturningMutationJdbcExecutor.MutationMeta,
+    private val commitId: Long,
     private val replicationEventDispatcher: ReplicationEventDispatcher,
     private val objectMapper: ObjectMapper
 ) : InvocationHandler {
@@ -160,9 +197,15 @@ private class PreparedStatementInvocationHandler(
                 val payload = objectMapper.createObjectNode()
                 for (idx in 1..columnCount) {
                     val columnName = meta.getColumnLabel(idx)
-                    payload.set<JsonNode>(columnName, toSafeJsonNode(normalizeJdbcValue(rs.getObject(idx))))
+                    val rawValue = normalizeJdbcValue(rs.getObject(idx))
+                    val normalizedValue = if (mutationMeta.operation == "DELETE" && columnName.equals("version", ignoreCase = true)) {
+                        ((rawValue as? Number)?.toLong() ?: 0L) + 1L
+                    } else {
+                        rawValue
+                    }
+                    payload.set<JsonNode>(columnName, toSafeJsonNode(normalizedValue))
                 }
-                replicationEventDispatcher.dispatchAfterCommit(mutationMeta.tableName, mutationMeta.operation, payload)
+                replicationEventDispatcher.dispatchAfterCommit(commitId, mutationMeta.tableName, mutationMeta.operation, payload)
             }
         }
         return rows

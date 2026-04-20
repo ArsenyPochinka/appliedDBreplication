@@ -16,6 +16,7 @@ spring:
 app:
   replication:
     topic: db-replication-events
+    max-requeue-iterations: 10
 
 server:
   port: 8082

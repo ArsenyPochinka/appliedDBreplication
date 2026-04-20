@@ -1,7 +1,10 @@
 package com.applied.replication.master.integration
 
+import com.applied.replication.common.ReplicationMessage
 import com.applied.replication.master.MasterApplication
 import com.applied.replication.receiver.ReceiverApplication
+import com.applied.replication.receiver.replication.ReplicationApplier
+import com.fasterxml.jackson.databind.ObjectMapper
 import jakarta.persistence.Column
 import jakarta.persistence.Entity
 import jakarta.persistence.EntityManager
@@ -45,7 +48,7 @@ import javax.sql.DataSource
 
 @SpringBootTest(classes = [MasterApplication::class])
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
-class EndToEndReplicationIntegrationTest {
+class EndToEndReplicationIT {
 
     @Autowired
     private lateinit var namedJdbc: NamedParameterJdbcTemplate
@@ -65,6 +68,8 @@ class EndToEndReplicationIntegrationTest {
     private lateinit var masterJdbc: JdbcTemplate
     private lateinit var slaveJdbc: JdbcTemplate
     private lateinit var receiverContext: ConfigurableApplicationContext
+    private lateinit var receiverApplier: ReplicationApplier
+    private val objectMapper = ObjectMapper()
 
     @BeforeAll
     fun beforeAll() {
@@ -88,10 +93,12 @@ class EndToEndReplicationIntegrationTest {
                     "spring.kafka.consumer.bootstrap-servers" to kafkaBootstrapServers,
                     "spring.kafka.consumer.group-id" to "service-receiver-test",
                     "spring.kafka.consumer.auto-offset-reset" to "earliest",
-                    "app.replication.topic" to "db-replication-events"
+                    "app.replication.topic" to "db-replication-events",
+                    "app.replication.max-requeue-iterations" to "10"
                 )
             )
             .run()
+        receiverApplier = receiverContext.getBean(ReplicationApplier::class.java)
     }
 
     @AfterAll
@@ -140,6 +147,65 @@ class EndToEndReplicationIntegrationTest {
                 updateTable2(client, table2Id, "upd_${client.name.lowercase()}")
             }
             awaitReplicationConsistency()
+            kotlin.test.assertEquals(1, masterJdbc.queryForObject("SELECT version FROM table_1 WHERE col_1 = ?", Int::class.java, table1Id))
+            kotlin.test.assertEquals(1, slaveJdbc.queryForObject("SELECT version FROM table_1 WHERE col_1 = ?", Int::class.java, table1Id))
+        }
+    }
+
+    @Nested
+    inner class VersioningAndOrderingTests {
+        @Test
+        fun `insert keeps version zero on both sides`() {
+            val id = insertTable1(MasterClient.JDBC_TEMPLATE, "ver_ins_${System.nanoTime()}")
+            awaitReplicationConsistency()
+            kotlin.test.assertEquals(0, masterJdbc.queryForObject("SELECT version FROM table_1 WHERE col_1 = ?", Int::class.java, id))
+            kotlin.test.assertEquals(0, slaveJdbc.queryForObject("SELECT version FROM table_1 WHERE col_1 = ?", Int::class.java, id))
+        }
+
+        @Test
+        fun `receiver skips stale message and applies only next version`() {
+            val id = nextTable1Id()
+            slaveJdbc.update(
+                "INSERT INTO table_1(col_1, col_2, col_3, version) VALUES (?, ?, now(), ?)",
+                id, "slave_version_$id", 2
+            )
+            val stalePayload = objectMapper.readTree("""{"col_1":$id,"col_2":"stale","col_3":"2026-01-01T00:00:00","version":2}""")
+            val staleResult = receiverApplier.apply(
+                ReplicationMessage(1, 111, "table_1", "UPDATE", stalePayload)
+            )
+            kotlin.test.assertEquals(ReplicationApplier.ApplyResult.SKIPPED, staleResult)
+
+            val nextPayload = objectMapper.readTree("""{"col_1":$id,"col_2":"fresh","col_3":"2026-01-01T00:00:00","version":3}""")
+            val nextResult = receiverApplier.apply(
+                ReplicationMessage(2, 112, "table_1", "UPDATE", nextPayload)
+            )
+            kotlin.test.assertEquals(ReplicationApplier.ApplyResult.APPLIED, nextResult)
+            kotlin.test.assertEquals(3, slaveJdbc.queryForObject("SELECT version FROM table_1 WHERE col_1 = ?", Int::class.java, id))
+        }
+
+        @Test
+        fun `receiver applies update as insert when row does not exist`() {
+            val id = nextTable1Id()
+            val payload = objectMapper.readTree("""{"col_1":$id,"col_2":"missing_inserted","col_3":"2026-01-01T00:00:00","version":0}""")
+            val result = receiverApplier.apply(
+                ReplicationMessage(3, 113, "table_1", "UPDATE", payload)
+            )
+            kotlin.test.assertEquals(ReplicationApplier.ApplyResult.APPLIED, result)
+            kotlin.test.assertEquals(0, slaveJdbc.queryForObject("SELECT version FROM table_1 WHERE col_1 = ?", Int::class.java, id))
+        }
+
+        @Test
+        fun `receiver marks delete for requeue when version is not next`() {
+            val id = nextTable1Id()
+            slaveJdbc.update(
+                "INSERT INTO table_1(col_1, col_2, col_3, version) VALUES (?, ?, now(), ?)",
+                id, "requeue_delete_$id", 2
+            )
+            val payload = objectMapper.readTree("""{"col_1":$id,"col_2":"requeue_delete_$id","col_3":"2026-01-01T00:00:00","version":6}""")
+            val result = receiverApplier.apply(
+                ReplicationMessage(4, 114, "table_1", "DELETE", payload)
+            )
+            kotlin.test.assertEquals(ReplicationApplier.ApplyResult.REQUEUE, result)
         }
     }
 
@@ -701,7 +767,9 @@ private class Table1Entity(
     @Column(name = "col_2")
     var col2: String = "",
     @Column(name = "col_3")
-    var col3: LocalDateTime = LocalDateTime.now()
+    var col3: LocalDateTime = LocalDateTime.now(),
+    @Column(name = "version")
+    var version: Int = 0
 )
 
 @Entity
@@ -733,5 +801,7 @@ private class Table2Entity(
     @Column(name = "col_14")
     var col14: LocalDateTime = LocalDateTime.now(),
     @Column(name = "col_15")
-    var col15: LocalDateTime = LocalDateTime.now()
+    var col15: LocalDateTime = LocalDateTime.now(),
+    @Column(name = "version")
+    var version: Int = 0
 )

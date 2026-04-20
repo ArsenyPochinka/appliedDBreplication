@@ -16,20 +16,22 @@ class ReplicationEventDispatcher(
 ) {
     private val eventSequence = AtomicLong(0)
 
-    fun dispatchAfterCommit(tableName: String, operation: String, payload: JsonNode) {
+    fun dispatchAfterCommit(commitId: Long, tableName: String, operation: String, payload: JsonNode) {
         val message = ReplicationMessage(
             eventId = eventSequence.incrementAndGet(),
+            commitId = commitId,
             tableName = tableName,
             operation = operation,
-            payload = payload
+            payload = payload,
+            iterationCount = 0
         )
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-            kafkaTemplate.send(topic, tableName, message)
+            kafkaTemplate.send(topic, commitId.toString(), message)
             return
         }
         TransactionSynchronizationManager.registerSynchronization(object : TransactionSynchronization {
             override fun afterCommit() {
-                kafkaTemplate.send(topic, tableName, message)
+                kafkaTemplate.send(topic, commitId.toString(), message)
             }
         })
     }

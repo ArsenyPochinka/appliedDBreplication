@@ -1,0 +1,8 @@
+spring:
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:receiver-replication-test-schema.sql
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
