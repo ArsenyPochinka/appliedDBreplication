@@ -1,10 +1,16 @@
 package com.applied.replication.master.jdbc
 
 import com.applied.replication.master.replication.ReplicationEventDispatcher
+import com.fasterxml.jackson.core.JsonProcessingException
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import java.sql.Array as SqlArray
+import java.sql.Blob
+import java.sql.Clob
 import java.sql.PreparedStatement
 import java.sql.ResultSet
+import java.sql.SQLXML
+import java.sql.Struct
 import org.springframework.beans.factory.config.BeanPostProcessor
 import org.springframework.jdbc.datasource.DelegatingDataSource
 import org.springframework.stereotype.Component
@@ -113,14 +119,14 @@ private class PreparedStatementInvocationHandler(
             "executeUpdate" -> {
                 val hasResultSet = target.execute()
                 if (hasResultSet) {
-                    publishResultRows(target.resultSet)
+                    return publishResultRows(target.resultSet)
                 }
                 target.updateCount
             }
             "executeLargeUpdate" -> {
                 val hasResultSet = target.execute()
                 if (hasResultSet) {
-                    publishResultRows(target.resultSet)
+                    return publishResultRows(target.resultSet).toLong()
                 }
                 target.largeUpdateCount
             }
@@ -141,20 +147,83 @@ private class PreparedStatementInvocationHandler(
         }
     }
 
-    private fun publishResultRows(resultSet: ResultSet?) {
+    private fun publishResultRows(resultSet: ResultSet?): Int {
         if (resultSet == null) {
-            return
+            return 0
         }
+        var rows = 0
         resultSet.use { rs ->
             val meta = rs.metaData
             val columnCount = meta.columnCount
             while (rs.next()) {
+                rows++
                 val payload = objectMapper.createObjectNode()
                 for (idx in 1..columnCount) {
                     val columnName = meta.getColumnLabel(idx)
-                    payload.set<JsonNode>(columnName, objectMapper.valueToTree(rs.getObject(idx)))
+                    payload.set<JsonNode>(columnName, toSafeJsonNode(normalizeJdbcValue(rs.getObject(idx))))
                 }
                 replicationEventDispatcher.dispatchAfterCommit(mutationMeta.tableName, mutationMeta.operation, payload)
+            }
+        }
+        return rows
+    }
+
+    private fun toSafeJsonNode(value: Any?): JsonNode {
+        return try {
+            objectMapper.valueToTree(value)
+        } catch (ex: IllegalArgumentException) {
+            objectMapper.valueToTree(value?.toString())
+        } catch (ex: JsonProcessingException) {
+            objectMapper.valueToTree(value?.toString())
+        }
+    }
+
+    private fun normalizeJdbcValue(value: Any?): Any? {
+        if (value == null) {
+            return null
+        }
+        return when (value) {
+            is SqlArray -> {
+                try {
+                    val arrayValue = value.array
+                    when (arrayValue) {
+                        is Array<*> -> arrayValue.map { normalizeJdbcValue(it) }
+                        is IntArray -> arrayValue.toList()
+                        is LongArray -> arrayValue.toList()
+                        is DoubleArray -> arrayValue.toList()
+                        is FloatArray -> arrayValue.toList()
+                        is BooleanArray -> arrayValue.toList()
+                        is ShortArray -> arrayValue.toList()
+                        is ByteArray -> arrayValue.toList()
+                        else -> arrayValue?.toString()
+                    }
+                } finally {
+                    kotlin.runCatching { value.free() }
+                }
+            }
+            is Clob -> value.characterStream.use { it.readText() }
+            is Blob -> value.binaryStream.use { it.readBytes().toList() }
+            is SQLXML -> value.string
+            is Struct -> value.attributes.map { normalizeJdbcValue(it) }
+            is java.sql.Date, is java.sql.Time, is java.sql.Timestamp -> value.toString()
+            else -> {
+                if (value.javaClass.name == "org.postgresql.util.PGobject") {
+                    val type = kotlin.runCatching {
+                        value.javaClass.getMethod("getType").invoke(value) as? String
+                    }.getOrNull()?.lowercase()
+                    val rawValue = kotlin.runCatching {
+                        value.javaClass.getMethod("getValue").invoke(value) as? String
+                    }.getOrNull()
+                    if (rawValue == null) {
+                        return null
+                    }
+                    if (type == "json" || type == "jsonb") {
+                        return kotlin.runCatching { objectMapper.readTree(rawValue) }.getOrElse { rawValue }
+                    }
+                    return rawValue
+                }
+                // Prevent JDBC driver internals from leaking into Jackson serialization.
+                if (value.javaClass.name.startsWith("org.postgresql.")) value.toString() else value
             }
         }
     }

@@ -1,10 +1,10 @@
 spring:
   datasource:
-    url: jdbc:postgresql://master-db:5432/master
-    username: master
-    password: master
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5433/master}
+    username: ${SPRING_DATASOURCE_USERNAME:master}
+    password: ${SPRING_DATASOURCE_PASSWORD:master}
   kafka:
-    bootstrap-servers: kafka:9092
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
 
 app:
   replication:

@@ -23,6 +23,10 @@ class ReplicationEventDispatcher(
             operation = operation,
             payload = payload
         )
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            kafkaTemplate.send(topic, tableName, message)
+            return
+        }
         TransactionSynchronizationManager.registerSynchronization(object : TransactionSynchronization {
             override fun afterCommit() {
                 kafkaTemplate.send(topic, tableName, message)

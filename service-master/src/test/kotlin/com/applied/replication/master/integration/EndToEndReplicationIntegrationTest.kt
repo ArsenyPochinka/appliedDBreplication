@@ -18,6 +18,8 @@ import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.TestInstance
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.EnumSource
 import org.springframework.beans.factory.annotation.Autowired
@@ -26,15 +28,13 @@ import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.context.ConfigurableApplicationContext
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate
+import org.springframework.jdbc.datasource.DataSourceUtils
 import org.springframework.jdbc.datasource.DriverManagerDataSource
 import org.springframework.test.context.DynamicPropertyRegistry
 import org.springframework.test.context.DynamicPropertySource
+import org.springframework.test.context.transaction.TestTransaction
 import org.springframework.transaction.support.TransactionTemplate
-import org.testcontainers.containers.KafkaContainer
-import org.testcontainers.containers.PostgreSQLContainer
-import org.testcontainers.junit.jupiter.Container
-import org.testcontainers.junit.jupiter.Testcontainers
-import org.testcontainers.utility.DockerImageName
+import org.springframework.transaction.annotation.Transactional
 import java.math.BigDecimal
 import java.sql.Connection
 import java.time.Duration
@@ -43,8 +43,8 @@ import java.time.LocalDateTime
 import java.time.LocalTime
 import javax.sql.DataSource
 
-@Testcontainers
 @SpringBootTest(classes = [MasterApplication::class])
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class EndToEndReplicationIntegrationTest {
 
     @Autowired
@@ -68,21 +68,26 @@ class EndToEndReplicationIntegrationTest {
 
     @BeforeAll
     fun beforeAll() {
-        migrate(masterDb.jdbcUrl, masterDb.username, masterDb.password, "db/changelog/master-test.yaml")
-        migrate(slaveDb.jdbcUrl, slaveDb.username, slaveDb.password, "db/changelog/slave-test.yaml")
+        migrate(masterJdbcUrl, masterDbUsername, masterDbPassword, "db/changelog/master-test.yaml")
+        migrate(slaveJdbcUrl, slaveDbUsername, slaveDbPassword, "db/changelog/slave-test.yaml")
 
-        masterJdbc = JdbcTemplate(DriverManagerDataSource(masterDb.jdbcUrl, masterDb.username, masterDb.password))
-        slaveJdbc = JdbcTemplate(DriverManagerDataSource(slaveDb.jdbcUrl, slaveDb.username, slaveDb.password))
+        masterJdbc = JdbcTemplate(DriverManagerDataSource(masterJdbcUrl, masterDbUsername, masterDbPassword))
+        slaveJdbc = JdbcTemplate(DriverManagerDataSource(slaveJdbcUrl, slaveDbUsername, slaveDbPassword))
 
         receiverContext = SpringApplicationBuilder(ReceiverApplication::class.java)
             .properties(
                 mapOf(
                     "server.port" to "0",
                     "spring.main.web-application-type" to "none",
-                    "spring.datasource.url" to slaveDb.jdbcUrl,
-                    "spring.datasource.username" to slaveDb.username,
-                    "spring.datasource.password" to slaveDb.password,
-                    "spring.kafka.bootstrap-servers" to kafka.bootstrapServers,
+                    "spring.liquibase.enabled" to "false",
+                    "spring.autoconfigure.exclude" to "org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration,org.springframework.boot.autoconfigure.data.jpa.JpaRepositoriesAutoConfiguration,org.springframework.boot.autoconfigure.liquibase.LiquibaseAutoConfiguration",
+                    "spring.datasource.url" to slaveJdbcUrl,
+                    "spring.datasource.username" to slaveDbUsername,
+                    "spring.datasource.password" to slaveDbPassword,
+                    "spring.kafka.bootstrap-servers" to kafkaBootstrapServers,
+                    "spring.kafka.consumer.bootstrap-servers" to kafkaBootstrapServers,
+                    "spring.kafka.consumer.group-id" to "service-receiver-test",
+                    "spring.kafka.consumer.auto-offset-reset" to "earliest",
                     "app.replication.topic" to "db-replication-events"
                 )
             )
@@ -110,8 +115,7 @@ class EndToEndReplicationIntegrationTest {
             val table1Col2 = "ins_t1_${client.name.lowercase()}_${System.nanoTime()}"
             val table2Col5 = "ins_t2_${client.name.lowercase()}_${System.nanoTime()}@example.com"
             transactionTemplate.executeWithoutResult {
-                insertTable1(client, table1Col2)
-                val table1Id = findTable1IdByCol2(table1Col2)
+                val table1Id = insertTable1(client, table1Col2)
                 insertTable2(
                     client,
                     table1Id,
@@ -155,29 +159,179 @@ class EndToEndReplicationIntegrationTest {
         }
     }
 
-    private fun insertTable1(client: MasterClient, col2: String) {
-        when (client) {
-            MasterClient.NAMED_JDBC -> namedJdbc.update(
-                "INSERT INTO table_1(col_2, col_3) VALUES (:col2, now())",
-                mapOf("col2" to col2)
-            )
-            MasterClient.JDBC_TEMPLATE -> plainJdbc.update(
-                "INSERT INTO table_1(col_2, col_3) VALUES (?, now())",
-                col2
-            )
-            MasterClient.RAW_JDBC -> rawExecute("INSERT INTO table_1(col_2, col_3) VALUES (?, now())") {
-                it.setString(1, col2)
+    @Nested
+    inner class SingleTransactionMultiInsertTests {
+        @Test
+        fun `replicates multiple inserts across two tables in one transaction`() {
+            transactionTemplate.executeWithoutResult {
+                val table1IdA = insertTable1(MasterClient.NAMED_JDBC, "tx_multi_t1_a_${System.nanoTime()}")
+                val table1IdB = insertTable1(MasterClient.JDBC_TEMPLATE, "tx_multi_t1_b_${System.nanoTime()}")
+                insertTable2(MasterClient.RAW_JDBC, table1IdA, "tx_multi_t2_a_${System.nanoTime()}@example.com", "tx_a")
+                insertTable2(MasterClient.JPA_NATIVE, table1IdB, "tx_multi_t2_b_${System.nanoTime()}@example.com", "tx_b")
             }
-            MasterClient.JPA_NATIVE -> entityManager.createNativeQuery(
-                "INSERT INTO table_1(col_2, col_3) VALUES (?1, now())"
-            ).setParameter(1, col2).executeUpdate()
-            MasterClient.JPA_ENTITY -> entityManager.persist(
-                Table1Entity(
-                    col1 = nextTable1Id(),
-                    col2 = col2,
-                    col3 = LocalDateTime.now()
+            awaitReplicationConsistency()
+        }
+
+        @Test
+        fun `replicates multi-row inserts in one transaction`() {
+            transactionTemplate.executeWithoutResult {
+                val t1Id1 = nextTable1Id()
+                val t1Id2 = nextTable1Id()
+                plainJdbc.update(
+                    """
+                    INSERT INTO table_1(col_1, col_2, col_3)
+                    VALUES (?, ?, now()), (?, ?, now())
+                    """.trimIndent(),
+                    t1Id1, "tx_bulk_t1_a_${System.nanoTime()}",
+                    t1Id2, "tx_bulk_t1_b_${System.nanoTime()}"
+                )
+
+                val t2Id1 = nextTable2Id()
+                val t2Id2 = nextTable2Id()
+                plainJdbc.update(
+                    """
+                    INSERT INTO table_2(
+                        col_1, col_2, col_3, col_4, col_5, col_6, col_7,
+                        col_8, col_9, col_10, col_11, col_12, col_13, col_14, col_15
+                    )
+                    VALUES
+                        (?, ?, 'bulk3_a', 'bulk4_a', ?, 500.10, true, DATE '1999-01-01', TIME '09:00:00', now(), '{"bulk":"a"}'::jsonb, ARRAY['a','b'], 11.1, now(), now()),
+                        (?, ?, 'bulk3_b', 'bulk4_b', ?, 600.20, false, DATE '1998-02-02', TIME '10:30:00', now(), '{"bulk":"b"}'::jsonb, ARRAY['c','d'], 22.2, now(), now())
+                    """.trimIndent(),
+                    t2Id1, t1Id1, "tx_bulk_t2_a_${System.nanoTime()}@example.com",
+                    t2Id2, t1Id2, "tx_bulk_t2_b_${System.nanoTime()}@example.com"
+                )
+            }
+            awaitReplicationConsistency()
+        }
+    }
+
+    @Nested
+    open inner class TransactionalAnnotationTests {
+        @Test
+        @Transactional
+        open fun `replicates inserts and updates across multiple rows and tables in one annotated transaction`() {
+            val t1Id1 = nextTable1Id()
+            val t1Id2 = nextTable1Id()
+            val t2Id1 = nextTable2Id()
+            val t2Id2 = nextTable2Id()
+            val uniq = System.nanoTime()
+
+            plainJdbc.update(
+                """
+                INSERT INTO table_1(col_1, col_2, col_3)
+                VALUES (?, ?, now()), (?, ?, now())
+                """.trimIndent(),
+                t1Id1, "tx_ann_t1_a_$uniq",
+                t1Id2, "tx_ann_t1_b_$uniq"
+            )
+
+            namedJdbc.update(
+                """
+                INSERT INTO table_2(
+                    col_1, col_2, col_3, col_4, col_5, col_6, col_7,
+                    col_8, col_9, col_10, col_11, col_12, col_13, col_14, col_15
+                )
+                VALUES
+                    (:id1, :fk1, 'ann3_a', 'ann4_a', :email1, 700.10, true, DATE '1997-07-07', TIME '07:00:00', now(), CAST(:meta1 AS jsonb), ARRAY['ann','a'], 33.3, now(), now()),
+                    (:id2, :fk2, 'ann3_b', 'ann4_b', :email2, 800.20, false, DATE '1996-06-06', TIME '06:30:00', now(), CAST(:meta2 AS jsonb), ARRAY['ann','b'], 44.4, now(), now())
+                """.trimIndent(),
+                mapOf(
+                    "id1" to t2Id1,
+                    "id2" to t2Id2,
+                    "fk1" to t1Id1,
+                    "fk2" to t1Id2,
+                    "email1" to "tx_ann_t2_a_$uniq@example.com",
+                    "email2" to "tx_ann_t2_b_$uniq@example.com",
+                    "meta1" to """{"tx":"annotation-a"}""",
+                    "meta2" to """{"tx":"annotation-b"}"""
                 )
             )
+
+            plainJdbc.update(
+                """
+                UPDATE table_1
+                SET col_2 = CONCAT(col_2, '_upd')
+                WHERE col_1 IN (?, ?)
+                """.trimIndent(),
+                t1Id1, t1Id2
+            )
+
+            namedJdbc.update(
+                """
+                UPDATE table_2
+                SET col_3 = :c3, col_4 = :c4, col_6 = :c6, col_15 = now()
+                WHERE col_1 = :id
+                """.trimIndent(),
+                mapOf("id" to t2Id1, "c3" to "ann3_a_upd", "c4" to "ann4_a_upd", "c6" to BigDecimal("999.99"))
+            )
+
+            rawExecute(
+                """
+                UPDATE table_2
+                SET col_3 = ?, col_4 = ?, col_6 = 555.55, col_15 = now()
+                WHERE col_1 = ?
+                """.trimIndent()
+            ) {
+                it.setString(1, "ann3_b_upd")
+                it.setString(2, "ann4_b_upd")
+                it.setLong(3, t2Id2)
+            }
+
+            TestTransaction.flagForCommit()
+            TestTransaction.end()
+
+            awaitReplicationConsistency()
+        }
+    }
+
+    private fun insertTable1(client: MasterClient, col2: String): Long {
+        return when (client) {
+            MasterClient.NAMED_JDBC -> {
+                val id = nextTable1Id()
+                namedJdbc.update(
+                    "INSERT INTO table_1(col_1, col_2, col_3) VALUES (:id, :col2, now())",
+                    mapOf("id" to id, "col2" to col2)
+                )
+                id
+            }
+            MasterClient.JDBC_TEMPLATE -> {
+                val id = nextTable1Id()
+                plainJdbc.update(
+                    "INSERT INTO table_1(col_1, col_2, col_3) VALUES (?, ?, now())",
+                    id,
+                    col2
+                )
+                id
+            }
+            MasterClient.RAW_JDBC -> {
+                val id = nextTable1Id()
+                rawExecute("INSERT INTO table_1(col_1, col_2, col_3) VALUES (?, ?, now())") {
+                    it.setLong(1, id)
+                    it.setString(2, col2)
+                }
+                id
+            }
+            MasterClient.JPA_NATIVE -> {
+                val id = nextTable1Id()
+                entityManager.createNativeQuery(
+                    "INSERT INTO table_1(col_1, col_2, col_3) VALUES (?1, ?2, now())"
+                ).setParameter(1, id)
+                    .setParameter(2, col2)
+                    .executeUpdate()
+                id
+            }
+            MasterClient.JPA_ENTITY -> {
+                val id = nextTable1Id()
+                entityManager.persist(
+                    Table1Entity(
+                        col1 = id,
+                        col2 = col2,
+                        col3 = LocalDateTime.now()
+                    )
+                )
+                id
+            }
         }
     }
 
@@ -370,24 +524,27 @@ class EndToEndReplicationIntegrationTest {
     }
 
     private fun seedTable1(col2: String): Long {
-        return masterJdbc.queryForObject(
-            "INSERT INTO table_1(col_2, col_3) VALUES (?, now()) RETURNING col_1",
-            Long::class.java,
+        val id = nextTable1Id()
+        masterJdbc.update(
+            "INSERT INTO table_1(col_1, col_2, col_3) VALUES (?, ?, now())",
+            id,
             col2
-        )!!
+        )
+        return id
     }
 
     private fun seedTable2(table1Id: Long, col5: String): Long {
-        return masterJdbc.queryForObject(
+        val id = nextTable2Id()
+        masterJdbc.update(
             """
-            INSERT INTO table_2(col_2, col_3, col_4, col_5, col_6, col_7, col_8, col_9, col_10, col_11, col_12, col_13, col_14, col_15)
-            VALUES (?, 'seed3', 'seed4', ?, 111.11, true, DATE '2000-01-01', TIME '08:00:00', now(), '{"seed":true}'::jsonb, ARRAY['seed'], 1.1, now(), now())
-            RETURNING col_1
+            INSERT INTO table_2(col_1, col_2, col_3, col_4, col_5, col_6, col_7, col_8, col_9, col_10, col_11, col_12, col_13, col_14, col_15)
+            VALUES (?, ?, 'seed3', 'seed4', ?, 111.11, true, DATE '2000-01-01', TIME '08:00:00', now(), '{"seed":true}'::jsonb, ARRAY['seed'], 1.1, now(), now())
             """.trimIndent(),
-            Long::class.java,
+            id,
             table1Id,
             col5
-        )!!
+        )
+        return id
     }
 
     private fun findTable1IdByCol2(col2: String): Long {
@@ -411,25 +568,73 @@ class EndToEndReplicationIntegrationTest {
     }
 
     private fun rawExecute(sql: String, binder: (java.sql.PreparedStatement) -> Unit) {
-        dataSource.connection.use { connection: Connection ->
+        val connection: Connection = DataSourceUtils.getConnection(dataSource)
+        try {
             connection.prepareStatement(sql).use { statement ->
                 binder(statement)
                 statement.executeUpdate()
             }
+        } finally {
+            DataSourceUtils.releaseConnection(connection, dataSource)
         }
     }
+
 
     private fun awaitReplicationConsistency() {
         Awaitility.await()
             .atMost(Duration.ofSeconds(30))
             .untilAsserted {
-                kotlin.test.assertEquals(tableRows(masterJdbc, "table_1"), tableRows(slaveJdbc, "table_1"))
-                kotlin.test.assertEquals(tableRows(masterJdbc, "table_2"), tableRows(slaveJdbc, "table_2"))
+                kotlin.test.assertEquals(
+                    normalizedRows(masterJdbc, "table_1"),
+                    normalizedRows(slaveJdbc, "table_1")
+                )
+                kotlin.test.assertEquals(
+                    normalizedRows(masterJdbc, "table_2"),
+                    normalizedRows(slaveJdbc, "table_2")
+                )
             }
     }
 
     private fun tableRows(jdbc: JdbcTemplate, table: String): List<Map<String, Any?>> {
         return jdbc.queryForList("SELECT * FROM $table ORDER BY col_1")
+    }
+
+    private fun normalizedRows(jdbc: JdbcTemplate, table: String): List<Map<String, Any?>> {
+        return tableRows(jdbc, table).map { row ->
+            row.toSortedMap().mapValues { (_, value) -> normalizeForAssertion(value) }
+        }
+    }
+
+    private fun normalizeForAssertion(value: Any?): Any? {
+        if (value == null) {
+            return null
+        }
+        return when (value) {
+            is java.sql.Timestamp,
+            is java.sql.Date,
+            is java.sql.Time -> value.toString()
+            is java.sql.Array -> {
+                try {
+                    val arr = value.array
+                    when (arr) {
+                        is Array<*> -> arr.map { normalizeForAssertion(it) }
+                        else -> arr?.toString()
+                    }
+                } finally {
+                    kotlin.runCatching { value.free() }
+                }
+            }
+            else -> {
+                if (value.javaClass.name == "org.postgresql.util.PGobject") {
+                    val raw = kotlin.runCatching {
+                        value.javaClass.getMethod("getValue").invoke(value) as? String
+                    }.getOrNull()
+                    raw ?: value.toString()
+                } else {
+                    value
+                }
+            }
+        }
     }
 
     private fun migrate(jdbcUrl: String, username: String, password: String, changelog: String) {
@@ -442,43 +647,44 @@ class EndToEndReplicationIntegrationTest {
     }
 
     companion object {
-        @Container
-        @JvmStatic
-        val kafka = KafkaContainer(DockerImageName.parse("apache/kafka:3.7.1"))
-
-        @Container
-        @JvmStatic
-        val masterDb = PostgreSQLContainer<Nothing>("postgres:16")
-            .apply {
-                withDatabaseName("master")
-                withUsername("master")
-                withPassword("master")
-            }
-
-        @Container
-        @JvmStatic
-        val slaveDb = PostgreSQLContainer<Nothing>("postgres:16")
-            .apply {
-                withDatabaseName("slave")
-                withUsername("slave")
-                withPassword("slave")
-            }
+        private val masterJdbcUrl = System.getProperty("test.master.jdbc-url")
+            ?: System.getenv("TEST_MASTER_JDBC_URL")
+            ?: "jdbc:postgresql://localhost:5433/master"
+        private val masterDbUsername = System.getProperty("test.master.username")
+            ?: System.getenv("TEST_MASTER_DB_USERNAME")
+            ?: "master"
+        private val masterDbPassword = System.getProperty("test.master.password")
+            ?: System.getenv("TEST_MASTER_DB_PASSWORD")
+            ?: "master"
+        private val slaveJdbcUrl = System.getProperty("test.slave.jdbc-url")
+            ?: System.getenv("TEST_SLAVE_JDBC_URL")
+            ?: "jdbc:postgresql://localhost:5434/slave"
+        private val slaveDbUsername = System.getProperty("test.slave.username")
+            ?: System.getenv("TEST_SLAVE_DB_USERNAME")
+            ?: "slave"
+        private val slaveDbPassword = System.getProperty("test.slave.password")
+            ?: System.getenv("TEST_SLAVE_DB_PASSWORD")
+            ?: "slave"
+        private val kafkaBootstrapServers = System.getProperty("test.kafka.bootstrap-servers")
+            ?: System.getenv("TEST_KAFKA_BOOTSTRAP_SERVERS")
+            ?: "localhost:29092"
 
         @DynamicPropertySource
         @JvmStatic
         fun registerProps(registry: DynamicPropertyRegistry) {
             registry.add("server.port") { "0" }
             registry.add("spring.main.web-application-type") { "none" }
-            registry.add("spring.datasource.url", masterDb::getJdbcUrl)
-            registry.add("spring.datasource.username", masterDb::getUsername)
-            registry.add("spring.datasource.password", masterDb::getPassword)
-            registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers)
+            registry.add("spring.liquibase.enabled") { false }
+            registry.add("spring.datasource.url") { masterJdbcUrl }
+            registry.add("spring.datasource.username") { masterDbUsername }
+            registry.add("spring.datasource.password") { masterDbPassword }
+            registry.add("spring.kafka.bootstrap-servers") { kafkaBootstrapServers }
             registry.add("app.replication.topic") { "db-replication-events" }
         }
     }
 }
 
-private enum class MasterClient {
+enum class MasterClient {
     NAMED_JDBC,
     JDBC_TEMPLATE,
     RAW_JDBC,
