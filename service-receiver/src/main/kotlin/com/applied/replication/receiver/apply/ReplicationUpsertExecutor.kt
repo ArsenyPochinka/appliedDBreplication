@@ -1,4 +1,4 @@
-package com.applied.replication.receiver.replication
+package com.applied.replication.receiver.apply
 
 import java.sql.SQLException
 import org.springframework.dao.DataAccessException

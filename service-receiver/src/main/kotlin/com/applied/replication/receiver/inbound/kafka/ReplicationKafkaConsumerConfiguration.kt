@@ -1,4 +1,4 @@
-package com.applied.replication.receiver.replication
+package com.applied.replication.receiver.inbound.kafka
 
 import com.applied.replication.common.ReplicationMessage
 import org.apache.kafka.clients.consumer.ConsumerConfig
@@ -12,7 +12,7 @@ import org.springframework.kafka.core.DefaultKafkaConsumerFactory
 import org.springframework.kafka.support.serializer.JsonDeserializer
 
 @Configuration
-class KafkaConsumerConfig {
+class ReplicationKafkaConsumerConfiguration {
 
     @Bean
     fun replicationConsumerFactory(kafkaProperties: KafkaProperties): ConsumerFactory<String, ReplicationMessage> {

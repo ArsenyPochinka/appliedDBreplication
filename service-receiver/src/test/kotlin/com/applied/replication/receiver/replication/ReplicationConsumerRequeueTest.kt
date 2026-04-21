@@ -2,6 +2,7 @@ package com.applied.replication.receiver.replication
 
 import com.applied.replication.common.ReplicationMessage
 import com.applied.replication.receiver.config.ReplicationProperties
+import com.applied.replication.receiver.inbound.kafka.ReplicationConsumer
 import com.fasterxml.jackson.databind.ObjectMapper
 import kotlin.test.assertEquals
 import org.junit.jupiter.api.BeforeEach

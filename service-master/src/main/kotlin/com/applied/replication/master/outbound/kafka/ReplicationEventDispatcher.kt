@@ -1,4 +1,4 @@
-package com.applied.replication.master.replication
+package com.applied.replication.master.outbound.kafka
 
 import com.applied.replication.common.ReplicationMessage
 import com.fasterxml.jackson.databind.JsonNode

@@ -1,12 +1,15 @@
-package com.applied.replication.master.jdbc
+package com.applied.replication.master.schema
 
 import org.springframework.boot.ApplicationArguments
 import org.springframework.boot.ApplicationRunner
+import org.springframework.core.Ordered
+import org.springframework.core.annotation.Order
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.stereotype.Component
 
 @Component
-class VersionColumnStartupValidator(
+@Order(Ordered.HIGHEST_PRECEDENCE)
+class VersionColumnPresenceStartupValidator(
     private val jdbcTemplate: JdbcTemplate
 ) : ApplicationRunner {
 

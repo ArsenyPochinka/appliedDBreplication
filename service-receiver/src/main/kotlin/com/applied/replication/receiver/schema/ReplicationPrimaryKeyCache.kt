@@ -1,4 +1,4 @@
-package com.applied.replication.receiver.replication
+package com.applied.replication.receiver.schema
 
 import jakarta.annotation.PostConstruct
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate

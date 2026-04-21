@@ -1,7 +1,8 @@
-package com.applied.replication.receiver.replication
+package com.applied.replication.receiver.inbound.kafka
 
 import com.applied.replication.common.ReplicationMessage
 import com.applied.replication.receiver.config.ReplicationProperties
+import com.applied.replication.receiver.replication.ReplicationApplier
 import org.springframework.kafka.annotation.KafkaListener
 import org.springframework.kafka.core.KafkaTemplate
 import org.springframework.stereotype.Component

@@ -6,30 +6,55 @@
 
 ## Как это работает
 
-### JDBC interception в `service-master`
+### `service-master`: от JDBC до Kafka
 
-- Любой `INSERT/UPDATE/DELETE`, который доходит до JDBC, автоматически перехватывается.
-- Для DML принудительно добавляется `RETURNING *` (или заменяется существующий `RETURNING ...`).
-- Для `UPDATE` автоматически добавляется `version = COALESCE(version, 0) + 1`, если `version` не обновляется явно.
-- Для `DELETE` в Kafka отправляется последний снимок строки, но с `version + 1`.
+1. **Прокси над `DataSource` (`MutationCapturingDataSourceBeanPostProcessor`)**  
+   После инициализации бина `DataSource` он оборачивается в `MutationCapturingDataSource`: каждый `getConnection()` возвращает прокси `Connection`, а `prepareStatement` / `prepareCall` — прокси `PreparedStatement`. Так перехватывается весь путь ORM (Hibernate, `JdbcTemplate`, нативные запросы), если он использует этот пул.
+
+2. **Переписывание DML (`MutationReturningSqlRewriter`)**  
+   Перед выполнением текста SQL для распознанных `INSERT` / `UPDATE` / `DELETE` добавляется или заменяется предложение `RETURNING *`. Для `UPDATE` при отсутствии явного присваивания `version` в `SET` внедряется `version = COALESCE(version, 0) + 1`.
+
+3. **`commitId` для группировки событий**  
+   Для каждого прокси `PreparedStatement` фиксируется `commitId`: при активной Spring-транзакции один и тот же id привязывается к транзакции (ресурс в `TransactionSynchronizationManager`); без транзакции — стабильный id на время жизни логического соединения с пулом. Это значение попадает во все сообщения Kafka по этой транзакции и используется как ключ сообщения.
+
+4. **Публикация после успешного DML (`JdbcRowReplicationPayloadMapper`)**  
+   После `executeUpdate` / `executeLargeUpdate` / `execute` читается `ResultSet` из `RETURNING`: по каждой строке собирается JSON (имена колонок как в `ResultSet`). Для `DELETE` значение колонки `version` в payload увеличивается на 1. Далее вызывается `ReplicationEventDispatcher.dispatchAfterCommit`.
+
+5. **Отправка в Kafka (`ReplicationEventDispatcher`, пакет `outbound.kafka`)**  
+   Регистрируется `TransactionSynchronization.afterCommit`: `KafkaTemplate.send` только после успешного коммита. Без активной транзакции (автокоммит) отправка выполняется сразу после выполнения запроса.
+
+6. **Валидация схемы при старте (пакет `schema`)**  
+   Два независимых `ApplicationRunner`: `VersionColumnPresenceStartupValidator` и `PrimaryKeyPresenceStartupValidator`. В текущей схеме (`current_schema()`) для всех `BASE TABLE` проверяются:
+   - наличие колонки `version` типа `integer`;
+   - наличие **PRIMARY KEY**.  
+   Нарушение любого правила останавливает старт (`require` с перечислением таблиц).
 
 ### Контракт `version`
 
-- В каждой таблице обязательно должно быть поле `version INTEGER`.
-- На старте `service-master` запускает валидацию схемы:
-  - если хотя бы в одной таблице нет `version INTEGER`, приложение не стартует.
+- В каждой таблице обязательно должно быть поле `version INTEGER` (проверяется при старте `service-master`, см. выше).
 - Рекомендуемый DDL:
   - `version INTEGER NOT NULL DEFAULT 0`
-- Поведение:
-  - insert -> версия 0;
-  - update -> версия +1;
-  - delete -> в событии передается последняя версия +1.
+- Поведение при репликации:
+  - insert → в БД обычно версия 0;
+  - update → инкремент `version` через переписанный SQL;
+  - delete → в событии Kafka передаётся снимок строки с `version + 1` в поле `version`.
 
 ### Первичный ключ (PK)
 
-- **У каждой реплицируемой таблицы в `master-db` и `slave-db` обязан быть первичный ключ (PRIMARY KEY).**
+- **У каждой реплицируемой таблицы в `master-db` и `slave-db` обязан быть первичный ключ (PRIMARY KEY).** На старте `service-master` проверяет наличие PK во всех таблицах текущей схемы; при отсутствии хотя бы у одной таблицы приложение **не запускается**.
 - Без PK репликация не согласуется с моделью событий: в `payload` приходят полные строки, а `service-receiver` строит `INSERT ... ON CONFLICT` и `DELETE` по ключу, сопоставляя строку в `slave` с сообщением.
-- Если у таблицы нет PK, `service-receiver` при обработке сообщения по этой таблице завершится ошибкой (`ReplicationApplier` явно это проверяет).
+- Если у таблицы нет PK в кэше receiver (таблица появилась после старта и т.п.), при обработке сообщения возможна ошибка в `ReplicationApplier`.
+
+### Генерируемые на уровне БД колонки (`SERIAL`, `IDENTITY`, `GENERATED`)
+
+Для предсказуемой репликации и корректного JSON в Kafka **в продуктовых таблицах не следует полагаться на значения, которые БД подставляет сама**, в частности:
+
+- типы вида **`SERIAL` / `BIGSERIAL`** и колонки **`GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY`**;
+- выражения **`GENERATED ALWAYS AS ... STORED`** (и аналоги), если бизнес-ключ или версия должны однозначно контролироваться приложением.
+
+Причина: событие строится из результата **`RETURNING *`** после DML. Хотя СУБД часто вернёт сгенерированное значение, поведение разных клиентов ORM и порядок flush/insert могут приводить к рассинхрону ожиданий; явные значения PK и `version` на стороне приложения проще согласовать с `service-receiver` и upsert по ключу. **Рекомендуется** задавать ключи и версии явно в приложении (например `BIGINT` без автоинкремента или идентификатор из сервиса генерации id).
+
+В тестовых Liquibase-скриптах этого репозитория `BIGSERIAL` может использоваться для краткости демо-схем; для боевых схем ориентируйтесь на явные ключи и описанный контракт.
 
 ### Kafka сообщение
 
@@ -58,8 +83,21 @@ Kafka key теперь равен `commitId` (строка).
   - **любая другая ошибка JDBC** при upsert (FK, NOT NULL, сеть и т.д.) — результат `REQUEUE`, `ReplicationConsumer` **снова публикует** то же сообщение в тот же topic с тем же ключом `commitId`, увеличив **`iterationCount` на 1**.
 - Лимит повторных прогонов: если `iterationCount > app.replication.max-requeue-iterations` (по умолчанию `10`), сообщение **больше не обрабатывается** (не вызывается `apply`, повторно в Kafka не отправляется). Порог задаётся в `service-receiver` `application.yml` (`app.replication.max-requeue-iterations`).
 - Выполнение upsert идет в **отдельной короткой транзакции** `REQUIRES_NEW` (`ReplicationUpsertExecutor`), чтобы ошибка SQL не оставляла внешнюю транзакцию в состоянии aborted.
-- Метаданные PK по всем таблицам `current_schema()` читаются **один раз при старте** `service-receiver` (`ReplicationPrimaryKeyCache`); таблицы, созданные только после старта, в кэше не появятся (нужен рестарт сервиса или расширение логики).
-- Поля строки из JSON в SQL собираются без `jsonb_populate_record`: выражения `(payload->>'col')::type` по `information_schema.columns` (для `text[]` поддержан `_text`).
+- Метаданные PK по всем таблицам `current_schema()` читаются **один раз при старте** (`ReplicationPrimaryKeyCache` в пакете `schema`); таблицы, созданные только после старта, в кэше не появятся (нужен рестарт сервиса или расширение логики).
+- Чтение колонок из `information_schema` и построение выражений `(payload->>'col')::type` вынесены в `apply.ReplicationTableColumnCatalog` и `apply.ReplicationPayloadJsonSqlExpressions` (для `text[]` поддержан `_text`).
+
+### Структура пакетов (основное)
+
+| Модуль | Пакет | Назначение |
+|--------|--------|------------|
+| `service-master` | `...master.mutation` | перехват JDBC, переписывание DML, маппинг строк `RETURNING` в JSON |
+| `service-master` | `...master.outbound.kafka` | публикация `ReplicationMessage` в Kafka после коммита, producer beans |
+| `service-master` | `...master.schema` | проверки схемы БД при старте (`version`, PK) |
+| `service-receiver` | `...receiver.inbound.kafka` | consumer/listener, конфигурация Kafka consumer/producer для receiver |
+| `service-receiver` | `...receiver.apply` | применение сообщения к БД: каталог колонок, SQL из JSON, upsert в отдельной транзакции, идентификаторы SQL |
+| `service-receiver` | `...receiver.schema` | кэш PK таблиц при старте |
+| `service-receiver` | `...receiver.replication` | координация: `ReplicationApplier` (оркестрация INSERT/UPDATE/DELETE) |
+| `service-receiver` | `...receiver.config` | свойства приложения |
 
 ## Запуск окружения
 
@@ -120,7 +158,7 @@ mvn -pl service-master -am -Dit.test=EndToEndReplicationIT\$VersioningAndOrderin
 
 ### Юнит-тесты `service-master` (SQL без БД)
 
-Файл: `service-master/src/test/kotlin/com/applied/replication/master/jdbc/ReturningMutationJdbcExecutorTest.kt`.
+Файл: `service-master/src/test/kotlin/com/applied/replication/master/mutation/MutationReturningSqlRewriterTest.kt`.
 
 | Сценарий | Проверка |
 |----------|------------|
@@ -132,7 +170,7 @@ mvn -pl service-master -am -Dit.test=EndToEndReplicationIT\$VersioningAndOrderin
 | Разбор `mutationMetaOrNull` (INSERT/UPDATE/DELETE) | `mutation meta parses table and operation` |
 
 ```bash
-mvn -pl service-master -am -Dtest=ReturningMutationJdbcExecutorTest -Dsurefire.failIfNoSpecifiedTests=false test
+mvn -pl service-master -am -Dtest=MutationReturningSqlRewriterTest -Dsurefire.failIfNoSpecifiedTests=false test
 ```
 
 (Это юнит-тест Surefire, достаточно фазы `test`.)

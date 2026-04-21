@@ -1,4 +1,4 @@
-package com.applied.replication.master.replication
+package com.applied.replication.receiver.inbound.kafka
 
 import com.applied.replication.common.ReplicationMessage
 import org.apache.kafka.clients.producer.ProducerConfig
@@ -12,10 +12,10 @@ import org.springframework.kafka.core.ProducerFactory
 import org.springframework.kafka.support.serializer.JsonSerializer
 
 @Configuration
-class KafkaProducerConfig {
+class ReplicationKafkaProducerConfiguration {
 
     @Bean
-    fun producerFactory(kafkaProperties: KafkaProperties): ProducerFactory<String, ReplicationMessage> {
+    fun receiverProducerFactory(kafkaProperties: KafkaProperties): ProducerFactory<String, ReplicationMessage> {
         val props = kafkaProperties.buildProducerProperties()
         props[ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG] = StringSerializer::class.java
         props[ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG] = JsonSerializer::class.java
@@ -23,7 +23,9 @@ class KafkaProducerConfig {
     }
 
     @Bean
-    fun replicationKafkaTemplate(producerFactory: ProducerFactory<String, ReplicationMessage>): KafkaTemplate<String, ReplicationMessage> {
-        return KafkaTemplate(producerFactory)
+    fun receiverKafkaTemplate(
+        receiverProducerFactory: ProducerFactory<String, ReplicationMessage>
+    ): KafkaTemplate<String, ReplicationMessage> {
+        return KafkaTemplate(receiverProducerFactory)
     }
 }

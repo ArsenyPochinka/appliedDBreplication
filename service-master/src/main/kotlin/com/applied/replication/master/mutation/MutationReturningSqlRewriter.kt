@@ -1,10 +1,14 @@
-package com.applied.replication.master.jdbc
+package com.applied.replication.master.mutation
 
 import org.springframework.stereotype.Component
 import java.util.regex.Pattern
 
+/**
+ * Rewrites DML statements so that PostgreSQL returns full rows via [RETURNING *]
+ * and applies the replication [version] increment rule for UPDATE when needed.
+ */
 @Component
-class ReturningMutationJdbcExecutor {
+class MutationReturningSqlRewriter {
     private val insertTablePattern = Pattern.compile("^\\s*INSERT\\s+INTO\\s+([\\w.]+)", Pattern.CASE_INSENSITIVE)
     private val updateTablePattern = Pattern.compile("^\\s*UPDATE\\s+([\\w.]+)", Pattern.CASE_INSENSITIVE)
     private val deleteTablePattern = Pattern.compile("^\\s*DELETE\\s+FROM\\s+([\\w.]+)", Pattern.CASE_INSENSITIVE)
@@ -72,5 +76,4 @@ class ReturningMutationJdbcExecutor {
         val tableName: String,
         val operation: String
     )
-
 }
